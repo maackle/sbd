@@ -16,8 +16,9 @@ enum TaskMsg {
         uniq: u64,
         index: usize,
         ws: Arc<dyn SbdWebsocket>,
-        ip: Arc<std::net::Ipv6Addr>,
+        ip: Arc<Ipv6Addr>,
         pk: PubKey,
+        maybe_auth: Option<(Option<Arc<str>>, AuthTokenTracker)>,
     },
     Close,
 }
@@ -37,7 +38,7 @@ struct CSlotInner {
     slots: Vec<SlotEntry>,
     slab: slab::Slab<SlabEntry>,
     pk_to_index: HashMap<PubKey, usize>,
-    ip_to_index: HashMap<Arc<std::net::Ipv6Addr>, Vec<usize>>,
+    ip_to_index: HashMap<Arc<Ipv6Addr>, Vec<usize>>,
     task_list: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -61,6 +62,9 @@ impl WeakCSlot {
 }
 
 /// A connection slot container.
+///
+/// Note this is not clone to ensure that when the single top-level handle
+/// is dropped, that everything is shutdown properly.
 pub struct CSlot(Arc<Mutex<CSlotInner>>);
 
 impl CSlot {
@@ -96,6 +100,7 @@ impl CSlot {
         WeakCSlot(Arc::downgrade(&self.0))
     }
 
+    /// Remove a websocket from its slot.
     fn remove(&self, uniq: u64, index: usize) {
         let mut lock = self.0.lock().unwrap();
 
@@ -117,13 +122,15 @@ impl CSlot {
         });
     }
 
+    /// Inner helper for inserting a websocket into an available slot.
     // oi clippy, this is super straight forward...
     #[allow(clippy::type_complexity)]
     fn insert_and_get_rate_send_list(
         &self,
-        ip: Arc<std::net::Ipv6Addr>,
+        ip: Arc<Ipv6Addr>,
         pk: PubKey,
         ws: Arc<dyn SbdWebsocket>,
+        maybe_auth: Option<(Option<Arc<str>>, AuthTokenTracker)>,
     ) -> std::result::Result<
         Vec<(u64, usize, Weak<dyn SbdWebsocket>)>,
         Arc<dyn SbdWebsocket>,
@@ -183,6 +190,7 @@ impl CSlot {
             ws,
             ip,
             pk,
+            maybe_auth,
         });
 
         Ok(rate_send_list)
@@ -192,11 +200,13 @@ impl CSlot {
     pub async fn insert(
         &self,
         config: &Config,
-        ip: Arc<std::net::Ipv6Addr>,
+        ip: Arc<Ipv6Addr>,
         pk: PubKey,
         ws: Arc<impl SbdWebsocket>,
+        maybe_auth: Option<(Option<Arc<str>>, AuthTokenTracker)>,
     ) {
-        let rate_send_list = self.insert_and_get_rate_send_list(ip, pk, ws);
+        let rate_send_list =
+            self.insert_and_get_rate_send_list(ip, pk, ws, maybe_auth);
 
         match rate_send_list {
             Ok(rate_send_list) => {
@@ -230,6 +240,7 @@ impl CSlot {
         }
     }
 
+    /// Mark a slotted websocket as ready.
     fn mark_ready(&self, uniq: u64, index: usize) {
         let mut lock = self.0.lock().unwrap();
         if let Some(slab) = lock.slab.get_mut(index) {
@@ -239,6 +250,7 @@ impl CSlot {
         }
     }
 
+    /// Get a websocket from its slot.
     fn get_sender(
         &self,
         pk: &PubKey,
@@ -265,6 +277,7 @@ impl CSlot {
         Ok((uniq, index, ws))
     }
 
+    /// Send via a slotted websocket.
     async fn send(&self, pk: &PubKey, payload: Payload) -> Result<()> {
         let (uniq, index, ws) = self.get_sender(pk)?;
 
@@ -278,9 +291,11 @@ impl CSlot {
     }
 }
 
+/// This top-task waits for incoming websockets, processes them until
+/// completion, and then waits for a new incoming websocket.
 async fn top_task(
     config: Arc<Config>,
-    ip_rate: Arc<ip_rate::IpRate>,
+    ip_rate: Arc<IpRate>,
     weak: WeakCSlot,
     mut recv: tokio::sync::mpsc::UnboundedReceiver<TaskMsg>,
 ) {
@@ -297,8 +312,10 @@ async fn top_task(
             ws,
             ip,
             pk,
+            maybe_auth,
         } = uitem
         {
+            // we have a websocket! process to completion
             let next_i = tokio::select! {
                 i = recv.recv() => Some(i),
                 _ = ws_task(
@@ -310,9 +327,11 @@ async fn top_task(
                     pk,
                     uniq,
                     index,
+                    maybe_auth,
                 ) => None,
             };
 
+            // our websocket task ended, clean up
             ws.close().await;
             drop(ws);
             if let Some(cslot) = weak.upgrade() {
@@ -329,22 +348,25 @@ async fn top_task(
     }
 }
 
+/// Process a single websocket until completion.
 #[allow(clippy::too_many_arguments)]
 async fn ws_task(
     config: &Arc<Config>,
-    ip_rate: &ip_rate::IpRate,
+    ip_rate: &IpRate,
     weak_cslot: &WeakCSlot,
     ws: &Arc<dyn SbdWebsocket>,
-    ip: Arc<std::net::Ipv6Addr>,
+    ip: Arc<Ipv6Addr>,
     pk: PubKey,
     uniq: u64,
     index: usize,
+    maybe_auth: Option<(Option<Arc<str>>, AuthTokenTracker)>,
 ) {
     let auth_res = tokio::time::timeout(config.idle_dur(), async {
         use rand::Rng;
         let mut nonce = [0xdb; 32];
         rand::thread_rng().fill(&mut nonce[..]);
 
+        // send them a nonce to prove they can sign with private key
         ws.send(cmd::SbdCmd::auth_req(&nonce)).await?;
 
         loop {
@@ -352,6 +374,14 @@ async fn ws_task(
 
             if !ip_rate.is_ok(&ip, auth_res.as_ref().len()).await {
                 return Err(Error::other("ip rate limited"));
+            }
+
+            if let Some((token, token_tracker)) = &maybe_auth {
+                // we already know they had a valid token
+                // when they opened this connection.
+                // just using this for side-effect marking token use time
+                let _ =
+                    token_tracker.check_is_token_valid(config, token.clone());
             }
 
             match cmd::SbdCmd::parse(auth_res)? {
@@ -391,11 +421,20 @@ async fn ws_task(
         return;
     }
 
+    // auth/init complete, now loop over incoming data
+
     while let Ok(Ok(payload)) =
         tokio::time::timeout(config.idle_dur(), ws.recv()).await
     {
         if !ip_rate.is_ok(&ip, payload.len()).await {
             break;
+        }
+
+        if let Some((token, token_tracker)) = &maybe_auth {
+            // we already know they had a valid token
+            // when they opened this connection.
+            // just using this for side-effect marking token use time
+            let _ = token_tracker.check_is_token_valid(config, token.clone());
         }
 
         let cmd = match cmd::SbdCmd::parse(payload) {
@@ -404,9 +443,13 @@ async fn ws_task(
         };
 
         match cmd {
+            // don't need to do anything... we just get a new timeout above
             cmd::SbdCmd::Keepalive => (),
+            // auth responses are invalid at this stage
             cmd::SbdCmd::AuthRes(_) => break,
+            // ignore unknown messages
             cmd::SbdCmd::Unknown => (),
+            // forward an actual message to a peer
             cmd::SbdCmd::Message(mut payload) => {
                 let dest = {
                     let payload = payload.to_mut();
@@ -428,4 +471,6 @@ async fn ws_task(
             }
         }
     }
+
+    tracing::debug!("Closed connection for {ip}");
 }
