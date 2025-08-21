@@ -19,32 +19,32 @@ axum = { workspace = true, default-features = false, features = [
   "tokio",
   "ws",
 ] }
-axum-server = { workspace = true, features = [ "tls-rustls" ] }
+axum-server = { workspace = true, features = ["tls-rustls-no-provider"] }
 base64 = { workspace = true }
 bytes = { workspace = true }
-clap = { workspace = true, features = [ "color", "derive", "wrap_help" ] }
+clap = { workspace = true, features = ["color", "derive", "wrap_help"] }
 ed25519-dalek = { workspace = true, default-features = false }
 futures = { workspace = true }
 rand = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
-serde = { workspace = true, features = [ "derive" ] }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 slab = { workspace = true }
-tokio = { workspace = true, features = [ "full" ] }
+tokio = { workspace = true, features = ["full"] }
 tokio-rustls = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = [ "env-filter" ] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 ureq = { workspace = true }
 
 [dev-dependencies]
-escargot = { workspace = true, features = [ "print" ] }
+escargot = { workspace = true, features = ["print"] }
 rcgen = { workspace = true }
 # don't use workspace, because that has a version
 # use path only so we can cargo publish without circular dep problems
-sbd-client = { path = "../sbd-client", features = [ "raw_client" ] }
+sbd-client = { path = "../sbd-client", features = ["raw_client"] }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = [ "test-util" ] }
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 default = []
